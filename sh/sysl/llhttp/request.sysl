@@ -1,0 +1,276 @@
+// Whole requests, assembled out of the event stream.
+//
+//     val r = requests((req) ->
+//         print(req.method + " " + req.target)
+//         print(req.header("host").unwrap_or("no host")))
+//
+//     r.feed(bytes)?
+//
+// **This is the tier a server writes against**, and `Parser` is what it is built on. The difference
+// is who does the bookkeeping: llhttp reports a header value as however many span callbacks the
+// bytes happened to be split into, so a server reading events directly has to concatenate them, keep
+// the field and the value in step, notice where one pair ends and the next begins, and decide what
+// to do when a client sends a body larger than the machine. Every server needs all of that and none
+// of it is the server's subject.
+//
+// **The limits are the reason this is not just convenience.** A request is accumulated in memory, so
+// something has to say how much: a server that grows a buffer for as long as bytes keep arriving is
+// one connection away from being over. `Limits` is that, it has defaults that suit an API server,
+// and exceeding one is a refusal rather than a crash.
+
+module sh.sysl.llhttp
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8_unchecked, Ascii}
+
+/** One header, as it arrived. The name keeps its original spelling; `Request.header` is what
+ * matches case-insensitively, which is what the standard says and what a client relies on.
+ */
+struct Header
+    name: string
+    value: string
+end Header
+
+/** A whole request.
+ *
+ * **`target` is the request target verbatim** -- `/path?query`, or an absolute URL from a proxy,
+ * or `*` for `OPTIONS`. It is not decoded, not split and not normalised: what a router does with
+ * it is the router's business, and a binding that guessed would be guessing wrong for somebody.
+ */
+struct Request
+    method: string
+    target: string
+    major: u8
+    minor: u8
+    headers: Buf[Header]
+    body: Buf[u8]
+
+    /** Whether the connection should stay open for another request. */
+    keep_alive: bool
+
+    /** Whether the client asked to upgrade to another protocol. */
+    upgrade: bool
+
+    /** The first header with this name, matched without regard to case.
+     *
+     * **The first, not the only.** A repeated header is legal for several names -- `Set-Cookie` is
+     * the famous one -- so `headers` is a list rather than a map and this is the convenience over
+     * it, not a claim that there was one.
+     */
+    header(self, name: string) -> Option[string]
+        for i in 0..<self.headers.len()
+            val h = self.headers.at(i)
+
+            if same_name(h.name, name) then return Some(h.value)
+
+        None
+
+    /** Every header with this name, in the order they arrived. */
+    header_all(self, name: string) -> Buf[string]
+        var out: Buf[string] = buf()
+
+        for i in 0..<self.headers.len()
+            val h = self.headers.at(i)
+
+            if same_name(h.name, name) then out.push(h.value)
+
+        out
+
+    /** The body as text, read as UTF-8 without checking it is any.
+     *
+     * A caller that is not sure reads `body` and validates it -- which is the right thing for a
+     * request body that came off the network, and the reason this is a separate method rather than
+     * the field's type.
+     */
+    text(self) -> string = from_utf8_unchecked(self.body.view())
+end Request
+
+/** Why a request was not delivered.
+ *
+ * **The two limits are not llhttp's**, and that is the point of the distinction: `Malformed` means
+ * the bytes were not HTTP, and the other two mean they were HTTP that this server has decided not
+ * to hold. A client sending the first is broken; a client sending the second may be doing exactly
+ * what it was told to.
+ */
+enum Refusal
+    Malformed(fault: Fault)
+    BodyTooLarge(limit: usize)
+    HeadTooLarge(limit: usize)
+
+    describe(self) -> string = self match
+        Malformed(f) -> "malformed request: " + f.reason
+        BodyTooLarge(n) -> "the body is larger than " + str(n) + " bytes"
+        HeadTooLarge(n) -> "the headers are larger than " + str(n) + " bytes"
+end Refusal
+
+impl Display for Refusal
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.describe(), out, fmt)
+
+/** How much of a request this server is willing to hold.
+ *
+ * The defaults suit an API server: 8 KiB of head is more than any browser sends and less than any
+ * attack, and a megabyte of body is a JSON document rather than a file upload. A server that
+ * accepts uploads raises `body` and should be streaming rather than accumulating -- which is what
+ * `Parser` is for, one tier down.
+ */
+struct Limits
+    head: usize
+    body: usize
+end Limits
+
+/** The defaults: 8 KiB of head, 1 MiB of body. */
+default_limits() -> Limits = Limits(8192, 1048576)
+
+/** A reader that turns bytes off a connection into whole requests. */
+struct Requests
+    private p: Option[&Parser]
+    private on: &Fn(&Request) -> unit
+    private limits: Limits
+
+    private method: string
+    private target: Buf[u8]
+    private headers: Buf[Header]
+    private body: Buf[u8]
+
+    // The header pair being assembled. `in_value` is what says which of the two the next span
+    // belongs to, and it is also what says a completed pair is waiting to be filed.
+    private field: Buf[u8]
+    private value: Buf[u8]
+    private in_value: bool
+
+    private head_bytes: usize
+    private refusal: Option[Refusal]
+
+    /** Read `bytes`.
+     *
+     * Every request completed by them is handed to the callback before this returns, so a caller
+     * that writes a response from the callback has written it by the time it gets the answer.
+     */
+    feed(*self, bytes: []const u8) -> Result[Stop, Refusal]
+        val p = self.p match
+            Some(q) -> q
+            None -> return Ok(Done)
+
+        val out = p.execute(bytes)
+
+        // A limit refused during the parse paused it, so llhttp reports a pause rather than a
+        // failure -- which is exactly right for llhttp and not what the caller asked about.
+        self.refusal match
+            Some(r) ->
+                self.refusal = None
+                return Err(r)
+            None -> ()
+
+        out match
+            Ok(s) -> Ok(s)
+            Err(f) -> Err(Malformed(f))
+
+    /** Tell the reader the connection closed, so that a request ending at end-of-file completes. */
+    finish(*self) -> Result[unit, Refusal] = self.p match
+        Some(q) -> q.finish() match
+            Ok(_) -> Ok(())
+            Err(f) -> Err(Malformed(f))
+        None -> Ok(())
+
+    private refuse(*self, r: Refusal)
+        self.refusal = Some(r)
+
+        self.p match
+            Some(q) -> q.pause()
+            None -> ()
+
+    // Charged against the head limit: every byte of every field and value. The request line is
+    // charged too, through `target`.
+    private charge_head(*self, n: usize) -> bool
+        self.head_bytes += n
+
+        if self.head_bytes > self.limits.head
+            self.refuse(HeadTooLarge(self.limits.head))
+            false
+        else
+            true
+
+    private flush_pair(*self)
+        if self.in_value
+            self.headers.push(Header(from_utf8_unchecked(self.field.view()),
+                                     from_utf8_unchecked(self.value.view())))
+            self.field.clear()
+            self.value.clear()
+            self.in_value = false
+
+    private start_over(*self)
+        self.method = ""
+        self.target.clear()
+        self.headers.clear()
+        self.body.clear()
+        self.field.clear()
+        self.value.clear()
+        self.in_value = false
+        self.head_bytes = 0
+
+    private event(*self, e: Event) = e match
+        MessageBegin -> self.start_over()
+
+        Method(b) -> self.method += from_utf8_unchecked(b)
+
+        Url(b) ->
+            if self.charge_head(b.len) then self.target.extend(b)
+
+        HeaderField(b) ->
+            self.flush_pair()
+
+            if self.charge_head(b.len) then self.field.extend(b)
+
+        HeaderValue(b) ->
+            self.in_value = true
+
+            if self.charge_head(b.len) then self.value.extend(b)
+
+        HeadersComplete -> self.flush_pair()
+
+        Body(b) ->
+            if self.body.len() + b.len > self.limits.body
+                self.refuse(BodyTooLarge(self.limits.body))
+            else
+                self.body.extend(b)
+
+        MessageComplete ->
+            // Trailers arrive after the last chunk and before this, so they are filed here for the
+            // same reason the ordinary headers are: a pair is complete when the next thing starts.
+            self.flush_pair()
+
+            val p = self.p match
+                Some(q) -> q
+                None -> return
+
+            val req: &Request = Request(self.method, from_utf8_unchecked(self.target.view()),
+                                        p.version().0, p.version().1,
+                                        self.headers, self.body, p.keep_alive(), p.is_upgrade())
+
+            self.on(req)
+            self.start_over()
+
+        _ -> ()
+end Requests
+
+/** A reader for one connection. `on` is called once per complete request. */
+requests(on: &Fn(&Request) -> unit, limits: Limits = default_limits()) -> &Requests
+    var r: &Requests = Requests(None, on, limits, "", buf(), buf(), buf(), buf(), buf(), false,
+                                0, None)
+
+    r.p = Some(request_parser((e) -> r.event(e)))
+    r
+
+// Two header names are the same name when they differ only in case, which is what RFC 9110 says and
+// what every client assumes. Compared byte by byte rather than by lowercasing both, so that matching
+// a name allocates nothing.
+private same_name(a: string, b: string) -> bool
+    val x = a.bytes
+    val y = b.bytes
+
+    if x.len != y.len then return false
+
+    for i in 0..<x.len
+        if x[i].to_lower() != y[i].to_lower() then return false
+
+    true

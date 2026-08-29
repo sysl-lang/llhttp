@@ -1,0 +1,69 @@
+// What a parse can answer, and what it can go wrong with.
+
+module sh.sysl.llhttp
+
+import sh.sysl.llhttp.c
+import sysl.text.from_cstring
+
+/** Where `execute` stopped.
+ *
+ * **`Done` is the ordinary answer** and means every byte was read. The other two mean the parser
+ * put itself down mid-buffer and said how far it got, so a caller that wants to carry on knows
+ * exactly which byte to carry on from.
+ */
+enum Stop
+    /** Every byte was consumed. */
+    Done
+
+    /** A handler called `pause`. `resume`, then `execute` the rest of the buffer from `consumed`. */
+    Paused(consumed: usize)
+
+    /** The message was an upgrade -- `Connection: upgrade`, or a `CONNECT` -- so the bytes from
+     * `consumed` on are whatever protocol was upgraded to and are not HTTP.
+     *
+     * A server that speaks the other protocol takes them and stops using this parser. One that does
+     * not calls `resume_after_upgrade` and treats them as the next request, which is what a proxy
+     * that declined the upgrade does.
+     */
+    Upgrade(consumed: usize)
+end Stop
+
+/** A refusal.
+ *
+ * **`code` is llhttp's `llhttp_errno_t`**, and the two strings come out of the library rather than
+ * being kept here: `name` is the constant's own spelling and `reason` is the sentence llhttp wrote
+ * when it stopped. `at` is how many bytes of the buffer had been read.
+ *
+ * A caller matching on a particular failure compares `code` against the constants in this module --
+ * `INVALID_METHOD`, `INVALID_TRANSFER_ENCODING` and the rest -- rather than against a string.
+ */
+struct Fault
+    code: i32
+    name: string
+    reason: string
+    at: usize
+
+    /** True for the four failures that mean the sender is trying it on rather than getting it
+     * wrong: a body length that two headers disagree about, a chunk size that is not one, a
+     * transfer encoding that is not a transfer encoding.
+     *
+     * **It is not a security decision on its own** -- llhttp has already refused, whichever this
+     * says. What it is for is logging: a malformed request from a browser is noise and a smuggling
+     * attempt is worth a line.
+     */
+    suspicious(self) -> bool =
+        self.code == c.INVALID_CONTENT_LENGTH ||
+        self.code == c.UNEXPECTED_CONTENT_LENGTH ||
+        self.code == c.INVALID_TRANSFER_ENCODING ||
+        self.code == c.INVALID_CHUNK_SIZE
+end Fault
+
+impl Display for Fault
+    display(self, out: *Writer, fmt: FormatSpec) =
+        display_str(self.name + " at byte " + str(self.at) + ": " + self.reason, out, fmt)
+
+/** Two faults are the same fault when they are the same code at the same place. */
+impl Eq for Fault
+    eq(self, rhs: Fault) -> bool = self.code == rhs.code && self.at == rhs.at
+
+private[llhttp] cstr(p: *u8, fallback: string) -> string = from_cstring(p).unwrap_or(fallback)

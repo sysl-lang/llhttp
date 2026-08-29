@@ -1,0 +1,343 @@
+module sh.sysl.llhttp
+@tests
+
+// What the parser does with real HTTP, including the requests nobody sends by accident.
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8_unchecked, Search}
+
+// A handler that writes down what it was told, so a test can assert on a transcript rather than on
+// a pile of separate counters. A span event is recorded as `name=bytes`, which makes a value that
+// arrived in two pieces visible as two lines rather than silently concatenated.
+private struct Log
+    lines: Buf[string]
+    body: string
+
+    add(*self, s: string) = self.lines.push(s)
+
+    /** Every line, joined by `|` -- the whole transcript as one string to compare against. */
+    transcript(self) -> string
+        var out = ""
+
+        for i in 0..<self.lines.len()
+            if i > 0 then out += "|"
+
+            out += self.lines.at(i)
+
+        out
+end Log
+
+private log() -> &Log = Log(buf(), "")
+
+// **A closure captures what its names are bound to when it is written**, so a handler cannot name
+// the parser it belongs to -- the parser does not exist until the handler has been passed to it.
+// A box that both of them hold is how the knot is untied, and it is the arrangement a real program
+// wants anyway: the thing a handler acts on is its own state, and the parser is one field of it.
+private struct Control
+    p: Option[&Parser]
+    saw_keep_alive: bool
+    l: &Log
+
+    pause(*self) = self.p match
+        Some(q) -> q.pause()
+        None -> ()
+
+    skip_body(*self) = self.p match
+        Some(q) -> q.skip_body()
+        None -> ()
+
+    parser_keep_alive(*self) -> bool = self.p match
+        Some(q) -> q.keep_alive()
+        None -> false
+end Control
+
+private control(l: &Log) -> &Control = Control(None, false, l)
+
+private recorder(l: &Log) -> &Fn(Event) -> unit = (e) -> e match
+    MessageBegin -> l.add("begin")
+    Url(b) -> l.add("url=" + from_utf8_unchecked(b))
+    Method(b) -> l.add("method=" + from_utf8_unchecked(b))
+    Status(b) -> l.add("status=" + from_utf8_unchecked(b))
+    Version(b) -> l.add("version=" + from_utf8_unchecked(b))
+    HeaderField(b) -> l.add("field=" + from_utf8_unchecked(b))
+    HeaderValue(b) -> l.add("value=" + from_utf8_unchecked(b))
+    HeadersComplete -> l.add("headers")
+    Body(b) -> l.body += from_utf8_unchecked(b)
+    MessageComplete -> l.add("done")
+    ChunkHeader(n) -> l.add("chunk=" + str(n))
+    ChunkComplete -> l.add("chunkend")
+    Reset -> l.add("reset")
+    _ -> ()
+
+// -- The ordinary cases --------------------------------------------------------------------------
+
+@test("a GET parses into the events it should, in the order it should")
+a_get_request()
+    val l = log()
+    val p = request_parser(recorder(l))
+
+    p.execute("GET /hello?name=Ada HTTP/1.1\r\nHost: example.com\r\n\r\n".bytes).expect("parsed")
+
+    assert_eq(l.transcript(),
+        "begin|method=GET|url=/hello?name=Ada|version=1.1|field=Host|value=example.com|headers|done")
+
+    assert_eq(p.method_name(), "GET")
+    assert_eq(p.version(), (1u8, 1u8))
+    assert(p.keep_alive(), "HTTP/1.1 keeps the connection by default")
+
+// **This is the case a hand-written parser gets wrong first**, and it is not exotic: a request
+// arriving in pieces is what a socket does under load. Feeding one byte at a time is the extreme of
+// it, and the transcript has to come out the same except where a span is genuinely split.
+@test("a request fed one byte at a time parses to the same headers")
+a_request_split_byte_by_byte()
+    val text = "POST /submit HTTP/1.1\r\nHost: e.com\r\nContent-Length: 5\r\n\r\nhello"
+    val l = log()
+    val p = request_parser(recorder(l))
+    val bytes = text.bytes
+
+    for i in 0..<bytes.len
+        p.execute(bytes[i..<i + 1]).expect("parsed a byte")
+
+    assert_eq(l.body, "hello")
+    assert_eq(p.method_name(), "POST")
+
+    // The spans arrive one byte at a time, so the transcript is not the whole-buffer one -- which is
+    // exactly why an accumulator that concatenates spans is the tier a program should be using.
+    assert(l.transcript().contains("headers"), "the head was still read")
+    assert(l.transcript().contains("done"), "and the message finished")
+
+@test("a body arrives whole when the buffer holds it")
+a_body_with_content_length()
+    val l = log()
+    val p = request_parser(recorder(l))
+
+    p.execute("PUT /x HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world".bytes).expect("parsed")
+
+    assert_eq(l.body, "hello world")
+    assert_eq(l.transcript(),
+        "begin|method=PUT|url=/x|version=1.1|field=Content-Length|value=11|headers|done")
+
+@test("a chunked body reports each chunk header and reassembles the body")
+a_chunked_body()
+    val l = log()
+    val p = request_parser(recorder(l))
+
+    p.execute(("POST /up HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" +
+               "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n").bytes).expect("parsed")
+
+    assert_eq(l.body, "hello world")
+    assert(l.transcript().contains("chunk=5|"), "the first chunk header carried its size")
+    assert(l.transcript().contains("chunk=6|"), "and so did the second")
+    assert(l.transcript().contains("chunk=0|"), "the last chunk is a zero-length one")
+    assert(l.transcript().ends_with("done"), "and the message completed")
+
+@test("two requests on one connection are two messages with a reset between them")
+keep_alive_pipelines_two_requests()
+    val l = log()
+    val p = request_parser(recorder(l))
+
+    p.execute(("GET /one HTTP/1.1\r\nHost: e.com\r\n\r\n" +
+               "GET /two HTTP/1.1\r\nHost: e.com\r\n\r\n").bytes).expect("parsed")
+
+    val t = l.transcript()
+
+    assert(t.contains("url=/one"), "the first request was read")
+    assert(t.contains("url=/two"), "and so was the second")
+    assert(t.contains("reset"), "with a reset announcing the second")
+
+// **`keep_alive` is read from inside the handler and nowhere else**, and this test is the reason
+// the method says so. llhttp answers from the flags of the message it is *currently* parsing, and by
+// the time `execute` returns it has already reset them for the next one -- so the same call that
+// answers `false` here answers `true` a few instructions later, with nothing to say it changed.
+@test("Connection: close is what keep_alive reports, read where it is settled")
+connection_close_ends_the_connection()
+    val l = log()
+    val c = control(l)
+
+    val p = request_parser((e) -> e match
+        MessageComplete -> c.saw_keep_alive = c.parser_keep_alive()
+        _ -> ())
+
+    c.p = Some(p)
+
+    p.execute("GET / HTTP/1.1\r\nConnection: close\r\n\r\n".bytes).expect("parsed")
+
+    assert(!c.saw_keep_alive, "the peer asked for the connection to end")
+
+    // The same connection with no such header keeps going, so the flag is being read rather than
+    // a constant being asserted.
+    val l2 = log()
+    val c2 = control(l2)
+
+    val p2 = request_parser((e) -> e match
+        MessageComplete -> c2.saw_keep_alive = c2.parser_keep_alive()
+        _ -> ())
+
+    c2.p = Some(p2)
+
+    p2.execute("GET / HTTP/1.1\r\n\r\n".bytes).expect("parsed")
+
+    assert(c2.saw_keep_alive, "and HTTP/1.1 with no Connection header does not")
+
+// -- The requests nobody sends by accident --------------------------------------------------------
+
+// **These are why the parser is llhttp rather than three hundred lines of sysl.** Each one is a
+// request-smuggling primitive: a request that one hop reads as having one body and the next reads as
+// having another. A parser that is merely lenient about them is a security defect in whatever is
+// built on it, so each is asserted as a refusal rather than left to be discovered.
+
+@test("two disagreeing Content-Length headers are refused")
+duplicate_content_length_is_refused()
+    val l = log()
+    val p = request_parser(recorder(l))
+
+    val e = p.execute("POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello"
+        .bytes).expect_err("refused")
+
+    assert(e.suspicious(), "a body two headers disagree about is worth a log line")
+
+@test("Content-Length together with a chunked Transfer-Encoding is refused")
+content_length_with_chunked_is_refused()
+    val l = log()
+    val p = request_parser(recorder(l))
+
+    p.execute("POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        .bytes).expect_err("refused")
+
+@test("a chunk size that is not a number is refused")
+a_bad_chunk_size_is_refused()
+    val l = log()
+    val p = request_parser(recorder(l))
+
+    val e = p.execute("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n".bytes)
+        .expect_err("refused")
+
+    assert(e.suspicious(), "a chunk size that is not one is worth a log line")
+
+@test("a method that is not one is refused, and the fault says where")
+a_bad_method_is_refused()
+    val l = log()
+    val p = request_parser(recorder(l))
+
+    val e = p.execute("GTE / HTTP/1.1\r\n\r\n".bytes).expect_err("refused")
+
+    assert(e.at > 0, "the fault points into the buffer rather than at the start")
+    assert(e.reason != "", "and llhttp said what it objected to")
+
+// -- Control ---------------------------------------------------------------------------------------
+
+@test("a handler that pauses stops the parse where it stood, and resuming finishes it")
+pause_and_resume()
+    val l = log()
+    val c = control(l)
+
+    val par = request_parser((e) -> e match
+        HeadersComplete ->
+            l.add("headers")
+            c.pause()
+        MessageComplete -> l.add("done")
+        _ -> ())
+
+    c.p = Some(par)
+
+    val text = "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello".bytes
+    val at = par.execute(text).expect("paused") match
+        Paused(n) -> n
+        _ -> 0
+
+    assert(at > 0, "it stopped part way through the buffer")
+    assert_eq(l.transcript(), "headers")
+
+    par.resume()
+    par.execute(text[at..<text.len]).expect("finished")
+
+    assert_eq(l.transcript(), "headers|done")
+
+@test("skip_body is how a response to HEAD is read")
+skip_body_on_a_head_response()
+    val l = log()
+    val c = control(l)
+
+    val par = response_parser((e) -> e match
+        HeadersComplete ->
+            l.add("headers")
+            c.skip_body()
+        MessageComplete -> l.add("done")
+        Body(b) -> l.body += from_utf8_unchecked(b)
+        _ -> ())
+
+    c.p = Some(par)
+
+    // A `Content-Length` describing a body that is never sent, which is what a HEAD response is.
+    par.execute("HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n".bytes).expect("parsed")
+
+    assert_eq(l.transcript(), "headers|done")
+    assert_eq(l.body, "", "no body was waited for")
+
+@test("a response with no length ends when the connection does, and finish is what says so")
+a_response_that_ends_at_eof()
+    val l = log()
+    val p = response_parser(recorder(l))
+
+    p.execute("HTTP/1.1 200 OK\r\n\r\nsome body".bytes).expect("parsed")
+
+    assert_eq(l.body, "some body")
+    assert(p.needs_eof(), "this message ends at end of file")
+    assert(!l.transcript().ends_with("done"), "so it is not complete yet")
+
+    p.finish().expect("finished")
+
+    assert(l.transcript().ends_with("done"), "and finish is what completes it")
+
+@test("a status line is read into the code and the reason")
+a_response_status_line()
+    val l = log()
+    val p = response_parser(recorder(l))
+
+    p.execute("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".bytes).expect("parsed")
+
+    assert_eq(p.status_code(), 404)
+    assert(l.transcript().contains("status=Not Found"), "the reason phrase arrived")
+
+@test("an upgrade stops the parse at the first byte that is not HTTP")
+an_upgrade_hands_back_the_rest()
+    val l = log()
+    val p = request_parser(recorder(l))
+
+    val text = ("GET /chat HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n" +
+                "not http at all").bytes
+
+    val at = p.execute(text).expect("stopped at the upgrade") match
+        Upgrade(n) -> n
+        _ -> 0
+
+    assert(p.is_upgrade(), "the request asked to upgrade")
+    assert_eq(from_utf8_unchecked(text[at..<text.len]), "not http at all")
+
+// -- The binding's own arrangement -----------------------------------------------------------------
+
+@test("an empty slice is a no-op rather than a null pointer handed to C")
+an_empty_execute_does_nothing()
+    val l = log()
+    val p = request_parser(recorder(l))
+    val nothing: []const u8 = []
+
+    p.execute(nothing).expect("nothing to do")
+
+    assert_eq(l.transcript(), "")
+
+    p.execute("GET / HTTP/1.1\r\n\r\n".bytes).expect("parsed")
+
+    assert(l.transcript().contains("done"), "and the parser was not disturbed by it")
+
+@test("reset starts over on the same storage")
+reset_starts_over()
+    val l = log()
+    val p = request_parser(recorder(l))
+
+    p.execute("GET /one HTTP/1.1\r\n\r\n".bytes).expect("parsed")
+    p.reset()
+    p.execute("GET /two HTTP/1.1\r\n\r\n".bytes).expect("parsed")
+
+    assert(l.transcript().contains("url=/one"), "the first request was read")
+    assert(l.transcript().contains("url=/two"), "and so was the second, after the reset")

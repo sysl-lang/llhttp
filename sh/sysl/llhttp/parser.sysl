@@ -1,0 +1,348 @@
+// The parser: bytes in, events out.
+//
+//     val p = request_parser((e) -> e match
+//         Url(bytes) -> print(from_utf8_unchecked(bytes))
+//         MessageComplete -> print("that was a request")
+//         _ -> ())
+//
+//     p.execute(chunk)?
+//
+// **One handler rather than twenty-five setters.** llhttp's settings struct is twenty-five separate
+// function pointers, and a binding that exposed twenty-five `on_*` methods would make the caller
+// write a closure per event and would make this file five times as long. An enum with a `match` in
+// it says the same thing, keeps every event in one place where a reader can see the order they
+// arrive in, and costs one indirect call that llhttp was going to make anyway.
+//
+// **A slice handed to a handler is the caller's own input buffer.** It is valid for the call and
+// not after it, exactly as libuv's read callback is: a handler that wants to keep bytes copies
+// them, and one that reads them and keeps what it found copies nothing. llhttp never copies
+// anything and neither does this.
+//
+// **A header can arrive in pieces.** `HeaderValue` is a *span* callback, so a value split across
+// two `execute` calls arrives as two `HeaderValue` events with a `HeaderValueComplete` after the
+// last. That is not an edge case to handle later -- it is what happens the first time a request
+// straddles two reads off a socket, which is most of them under load. `Requests` in
+// `request.sysl` is the accumulator that already does this.
+
+module sh.sysl.llhttp
+
+import sh.sysl.llhttp.c
+import sysl.slices.as_ptr
+
+/** Something llhttp found. The variants are its twenty-five callbacks, in the order the header
+ * declares them.
+ *
+ * **The `_Complete` events are boundaries, not repeats.** `Url` says "here are some bytes of the
+ * URL"; `UrlComplete` says "that was all of it". A handler that accumulates spans uses the first
+ * and a handler that acts on a finished field uses the second.
+ */
+enum Event
+    /** A new message has started. Nothing has been read yet. */
+    MessageBegin
+
+    Protocol(bytes: []const u8)
+    Url(bytes: []const u8)
+    Status(bytes: []const u8)
+    Method(bytes: []const u8)
+    Version(bytes: []const u8)
+    HeaderField(bytes: []const u8)
+    HeaderValue(bytes: []const u8)
+    ChunkExtensionName(bytes: []const u8)
+    ChunkExtensionValue(bytes: []const u8)
+
+    /** Every header has been read. The method, the status code and the version are readable now,
+     * and `skip_body` is the one thing that may only be called from here.
+     */
+    HeadersComplete
+
+    Body(bytes: []const u8)
+
+    /** The message is over. For a keep-alive connection the next byte starts the next one. */
+    MessageComplete
+
+    ProtocolComplete
+    UrlComplete
+    StatusComplete
+    MethodComplete
+    VersionComplete
+    HeaderFieldComplete
+    HeaderValueComplete
+    ChunkExtensionNameComplete
+    ChunkExtensionValueComplete
+
+    /** A chunk header, carrying the size llhttp read out of it. A size of `0` is the last chunk,
+     * and the trailers -- if there are any -- arrive as more `HeaderField`/`HeaderValue` pairs.
+     */
+    ChunkHeader(size: u64)
+
+    ChunkComplete
+
+    /** A keep-alive connection has been reset for the next message on it. */
+    Reset
+end Event
+
+/** An HTTP/1.1 parser. Reached through `&Parser`, and alive for as long as anything holds one.
+ *
+ * **It is a `&T` because llhttp hands a callback nothing but the parser's own address.** The
+ * trampolines below work back from that address to this value, which is only sound while the value
+ * has not moved -- and a box does not move. Nothing else keeps it alive: `parser()` puts a
+ * reference to the box inside the box, the same arrangement every callback-driven binding in this
+ * org uses.
+ */
+struct Parser
+    // llhttp's own storage. The trampolines find their way here from its address, so this field's
+    // offset is what `home` subtracts -- it is not required to be first, only to be found.
+    private core: [c.PARSER_WORDS]u64
+
+    // The twenty-five function pointers llhttp is given. It keeps the address rather than a copy,
+    // so this has to live as long as the parser does, which is why it is a field and not a local.
+    private cfg: c.Settings
+
+    private me: Option[&Parser]
+    private handler: &Fn(Event) -> unit
+
+    // Set by `skip_body` and read once, by the `on_headers_complete` trampoline.
+    private skip: bool
+
+    // Set by `pause` and read by whichever trampoline is running, which turns it into the
+    // `HPE_PAUSED` llhttp wants a callback to *return*. `inside` is what tells `pause` which of
+    // its two mechanisms to use.
+    private pausing: bool
+    private inside: bool
+
+    private raw(*self) -> *c.Parser = ptr_cast(&self.core[0])
+
+    /** Read `bytes`.
+     *
+     * **Call it with whatever arrived**, however little: llhttp keeps its own state, so a request
+     * split across forty reads parses exactly as one delivered whole.
+     *
+     * An empty slice answers `Done` without calling llhttp, since `data + 0` on a null pointer is
+     * not something ISO C defines and an empty read is what a caller has after a zero-length
+     * recv.
+     */
+    execute(*self, bytes: []const u8) -> Result[Stop, Fault]
+        if bytes.len == 0 then return Ok(Done)
+
+        val rc = c.execute(self.raw(), as_ptr(bytes), bytes.len)
+
+        if rc == c.OK then return Ok(Done)
+
+        val at = usize(c.get_error_pos(self.raw())) - usize(as_ptr(bytes))
+
+        if rc == c.PAUSED then Ok(Paused(at))
+        else if rc == c.PAUSED_UPGRADE then Ok(Upgrade(at))
+        else Err(self.fault(at))
+
+    /** Tell the parser the connection closed.
+     *
+     * **This is not a formality.** A response with neither `Content-Length` nor chunked encoding
+     * ends when the connection does, so the last `MessageComplete` of such a message is emitted
+     * from here and nowhere else. Called on a message that was already complete it answers `Ok`;
+     * called mid-header it is the failure that says the peer hung up in the middle.
+     */
+    finish(*self) -> Result[unit, Fault]
+        val rc = c.finish(self.raw())
+
+        if rc == c.OK then Ok(()) else Err(self.fault(0))
+
+    /** Start over on the same storage, keeping the handler and the lenient settings.
+     *
+     * A keep-alive connection does **not** need this -- llhttp resets itself between messages and
+     * emits `Reset` when it does. It is for reusing a parser on a *different* connection.
+     */
+    reset(*self) = c.reset(self.raw())
+
+    /** Stop after the current event, without it being a failure. `execute` answers
+     * `Paused(consumed)`, and `resume` followed by another `execute` from that byte carries on.
+     *
+     * This is how a handler refuses a request: pause, then close the connection instead of
+     * resuming. There is no way to return an error from a handler, and there does not need to be.
+     *
+     * **llhttp has two mechanisms here and using the wrong one silently does nothing**, which is
+     * worth knowing because a caller of this method never has to choose. `llhttp_pause` is for
+     * outside a callback; a callback has to *return* `HPE_PAUSED`, and llhttp's own header says so
+     * in a note easy to read past. So this sets a flag when it is called from inside a handler --
+     * which the trampoline turns into that return value -- and calls `llhttp_pause` when it is
+     * not. Written the obvious way instead, a `pause` from a handler parses the whole buffer and
+     * reports `Done`.
+     */
+    pause(*self) =
+        if self.inside then self.pausing = true
+        else c.pause(self.raw())
+
+    /** Carry on after a `pause`. */
+    resume(*self) = c.resume(self.raw())
+
+    /** Carry on after an `Upgrade`, treating what follows as the next HTTP message. A server that
+     * declined the upgrade wants this; one that is about to speak the other protocol does not.
+     */
+    resume_after_upgrade(*self) = c.resume_after_upgrade(self.raw())
+
+    /** Say that this message has no body, from inside a `HeadersComplete` handler.
+     *
+     * **It is only meaningful there** and does nothing anywhere else, because it is read once, on
+     * the way out of that callback. The case it exists for is a response to `HEAD`, which carries
+     * a `Content-Length` describing a body that is not going to arrive -- a parser that believed
+     * the header would wait forever for bytes belonging to the next response.
+     */
+    skip_body(*self) = self.skip = true
+
+    /** The request method as llhttp's number -- compare it against `GET`, `POST` and the rest. */
+    method(*self) -> u8 = c.get_method(self.raw())
+
+    /** The method as it is spelled on the wire. */
+    method_name(*self) -> string = cstr(c.method_name(self.method()), "UNKNOWN")
+
+    /** The response status code. Zero on a request parser. */
+    status_code(*self) -> int = int(c.get_status_code(self.raw()))
+
+    /** The major and minor version -- `1` and `1` for HTTP/1.1. */
+    version(*self) -> (u8, u8) = (c.get_http_major(self.raw()), c.get_http_minor(self.raw()))
+
+    /** Whether the message asked to upgrade to another protocol. Readable from `HeadersComplete`
+     * on, and what makes `execute` answer `Upgrade` at the end of the head.
+     */
+    is_upgrade(*self) -> bool = c.get_upgrade(self.raw()) != 0
+
+    /** Whether the connection should be kept open after this message.
+     *
+     * **Read it from a `MessageComplete` handler**, which is the only place the answer is settled:
+     * it depends on the version and on the `Connection` header, and llhttp knows both by then.
+     */
+    keep_alive(*self) -> bool = c.should_keep_alive(self.raw()) != 0
+
+    /** Whether this message is one that ends at end-of-file rather than at a length -- so that a
+     * caller knows `finish` is what completes it.
+     */
+    needs_eof(*self) -> bool = c.message_needs_eof(self.raw()) != 0
+
+    private fault(*self, at: usize) -> Fault
+        val rc = c.get_errno(self.raw())
+
+        Fault(rc, cstr(c.errno_name(rc), "HPE_UNKNOWN"),
+              cstr(c.get_error_reason(self.raw()), "no reason given"), at)
+end Parser
+
+// ## Finding the way home
+//
+// llhttp hands a callback the parser's address and nothing else. There is a `data` field for the
+// caller's own word, and it is not used here: the parser's storage is a field of the sysl `Parser`,
+// so subtracting that field's offset from the address llhttp gave is the whole of the journey, and
+// it needs no C, no setter and no second thing to keep in step.
+
+private home(p: *c.Parser) -> *Parser = ptr_cast(usize(p) - offsetof(Parser, core))
+
+// The chunk size llhttp read, which it reports in a field with no accessor. The offset comes from
+// the C compiler, so a reordering of `llhttp_t` follows it rather than breaking it.
+private chunk_size(p: *c.Parser) -> u64
+    val q: *u64 = ptr_cast(usize(p) + c.CONTENT_LENGTH_OFFSET)
+
+    *q
+
+// ## The trampolines
+//
+// One per callback, each turning C's arguments into an `Event` and answering `0` for "carry on".
+// A handler that wants to stop calls `pause`, which is llhttp's own mechanism and needs no return
+// value plumbed through twenty-five functions.
+
+// Every event goes through here, so that "the handler asked to pause" is turned into llhttp's
+// answer in one place rather than twenty-five. `inside` is raised for exactly the span of the
+// handler's call, which is what lets `pause` know which of llhttp's two mechanisms it is in.
+private fire(p: *c.Parser, e: Event) -> i32
+    val s = home(p)
+
+    s.inside = true
+    s.handler(e)
+    s.inside = false
+
+    if s.pausing
+        s.pausing = false
+        c.PAUSED
+    else
+        0
+
+private ev_message_begin(p: *c.Parser) -> i32 = fire(p, MessageBegin)
+
+private ev_protocol(p: *c.Parser, at: *u8, n: usize) -> i32 = fire(p, Protocol(at[0..<n]))
+private ev_url(p: *c.Parser, at: *u8, n: usize) -> i32 = fire(p, Url(at[0..<n]))
+private ev_status(p: *c.Parser, at: *u8, n: usize) -> i32 = fire(p, Status(at[0..<n]))
+private ev_method(p: *c.Parser, at: *u8, n: usize) -> i32 = fire(p, Method(at[0..<n]))
+private ev_version(p: *c.Parser, at: *u8, n: usize) -> i32 = fire(p, Version(at[0..<n]))
+private ev_header_field(p: *c.Parser, at: *u8, n: usize) -> i32 = fire(p, HeaderField(at[0..<n]))
+private ev_header_value(p: *c.Parser, at: *u8, n: usize) -> i32 = fire(p, HeaderValue(at[0..<n]))
+
+private ev_chunk_ext_name(p: *c.Parser, at: *u8, n: usize) -> i32 =
+    fire(p, ChunkExtensionName(at[0..<n]))
+
+private ev_chunk_ext_value(p: *c.Parser, at: *u8, n: usize) -> i32 =
+    fire(p, ChunkExtensionValue(at[0..<n]))
+
+// The one callback whose return value says more than "carry on". A pause wins over a skip, since a
+// paused parse is not going to read a body either way.
+private ev_headers_complete(p: *c.Parser) -> i32
+    val s = home(p)
+
+    s.skip = false
+
+    val rc = fire(p, HeadersComplete)
+
+    if rc != 0 then rc
+    else if s.skip then 1
+    else 0
+
+private ev_body(p: *c.Parser, at: *u8, n: usize) -> i32 = fire(p, Body(at[0..<n]))
+
+private ev_message_complete(p: *c.Parser) -> i32 = fire(p, MessageComplete)
+private ev_protocol_complete(p: *c.Parser) -> i32 = fire(p, ProtocolComplete)
+private ev_url_complete(p: *c.Parser) -> i32 = fire(p, UrlComplete)
+private ev_status_complete(p: *c.Parser) -> i32 = fire(p, StatusComplete)
+private ev_method_complete(p: *c.Parser) -> i32 = fire(p, MethodComplete)
+private ev_version_complete(p: *c.Parser) -> i32 = fire(p, VersionComplete)
+private ev_header_field_complete(p: *c.Parser) -> i32 = fire(p, HeaderFieldComplete)
+private ev_header_value_complete(p: *c.Parser) -> i32 = fire(p, HeaderValueComplete)
+private ev_chunk_ext_name_complete(p: *c.Parser) -> i32 = fire(p, ChunkExtensionNameComplete)
+private ev_chunk_ext_value_complete(p: *c.Parser) -> i32 = fire(p, ChunkExtensionValueComplete)
+
+private ev_chunk_header(p: *c.Parser) -> i32 = fire(p, ChunkHeader(chunk_size(p)))
+private ev_chunk_complete(p: *c.Parser) -> i32 = fire(p, ChunkComplete)
+private ev_reset(p: *c.Parser) -> i32 = fire(p, Reset)
+
+// ## Making one
+
+/** A parser for requests -- what a server wants. */
+request_parser(on: &Fn(Event) -> unit) -> &Parser = parser(on, c.TYPE_REQUEST)
+
+/** A parser for responses -- what a client wants. */
+response_parser(on: &Fn(Event) -> unit) -> &Parser = parser(on, c.TYPE_RESPONSE)
+
+/** A parser that works out from the first line whether it is reading a request or a response.
+ *
+ * **Do not use it on a server.** Autodetection means a request whose first line looks like a status
+ * line is read as a response, which is a request-smuggling primitive rather than a convenience. It
+ * is here for a program reading a capture, where nobody is attacking the reader.
+ */
+either_parser(on: &Fn(Event) -> unit) -> &Parser = parser(on, c.TYPE_BOTH)
+
+/** A parser of the given llhttp type, for a caller that has the number rather than the intent. */
+parser(on: &Fn(Event) -> unit, ty: u8) -> &Parser
+    var p: &Parser = Parser([0; c.PARSER_WORDS], settings(), None, on, false, false, false)
+
+    p.me = Some(p)
+    c.init(p.raw(), ty, ptr_cast(&p.cfg))
+    p
+
+// Every slot filled, so that every event reaches the one handler. llhttp skips a null callback, so
+// a binding that wanted to pay only for the events a caller asked for would leave some of these
+// out -- at the cost of a setter per event and a settings struct that has to be rebuilt when one
+// changes. One indirect call into a `match` is the cheaper trade.
+private settings() -> c.Settings = c.Settings(
+    &ev_message_begin,
+    &ev_protocol, &ev_url, &ev_status, &ev_method, &ev_version,
+    &ev_header_field, &ev_header_value, &ev_chunk_ext_name, &ev_chunk_ext_value,
+    &ev_headers_complete,
+    &ev_body,
+    &ev_message_complete, &ev_protocol_complete, &ev_url_complete, &ev_status_complete,
+    &ev_method_complete, &ev_version_complete, &ev_header_field_complete,
+    &ev_header_value_complete, &ev_chunk_ext_name_complete, &ev_chunk_ext_value_complete,
+    &ev_chunk_header, &ev_chunk_complete, &ev_reset)

@@ -1,0 +1,61 @@
+module sh.sysl.llhttp.c
+@tests
+
+// The survey's questions, asked of the real compiler.
+//
+// Every number below was measured with a C program compiled against the vendored header before it
+// was written here, so a disagreement means sysl and clang see llhttp differently -- which is the
+// only failure this file is looking for.
+
+// -- The parser's storage ----------------------------------------------------------------------
+
+// **`llhttp_t` is 96 bytes and wants 8**, which is what lets the layer above carry it as twelve
+// `u64`s: an array of `u64` is 8-aligned by construction, where a `[96]u8` promises nothing.
+//
+// A future llhttp with another field changes the first number and this test with it. That is the
+// point of asserting it -- the alignment is the one that would corrupt silently.
+@test("the parser fits in the words the layer above reserves")
+parser_storage_is_twelve_aligned_words()
+    assert_eq(PARSER_SIZE, 96)
+    assert_eq(PARSER_ALIGN, 8)
+    assert_eq(PARSER_WORDS, 12)
+end parser_storage_is_twelve_aligned_words
+
+// **This is the load-bearing one.** `Settings` is declared field by field in sysl rather than left
+// opaque, because every one of its members has to be written and llhttp offers no setter. That is
+// safe only while sysl's layout and C's agree, and a struct of nothing but pointers is the easiest
+// case there is -- so what could actually go wrong is a *count*: an llhttp that grew a twenty-sixth
+// callback would have sysl writing into 200 bytes of a 208-byte struct and leaving the last one
+// holding whatever was there.
+//
+// Comparing the two sizes catches exactly that, and catches it at the first `sysl test` after the
+// vendored copy is updated rather than at a call into an uninitialised pointer.
+@test("the sysl Settings struct is the size C says llhttp_settings_t is")
+settings_layout_agrees_with_c()
+    assert_eq(sizeof(Settings), SETTINGS_SIZE)
+    assert_eq(SETTINGS_SIZE, 200)
+end settings_layout_agrees_with_c
+
+// The two fields reached by offset rather than by an accessor. Asked of the C compiler, so they
+// follow a reordering on their own; asserted here so that a reordering is *visible* rather than
+// merely survived.
+@test("the fields with no accessor are where C says they are")
+field_offsets_are_the_headers()
+    assert_eq(CONTENT_LENGTH_OFFSET, 64)
+    assert_eq(FLAGS_OFFSET, 82)
+end field_offsets_are_the_headers
+
+// -- The constants -----------------------------------------------------------------------------
+
+// A `c const` reads an `enum` constant and not only a `#define`, which is what makes this binding
+// shim-free: llhttp's errors, methods and types are all enumerations.
+@test("the enumerations read as their C values")
+enum_constants_are_read()
+    assert_eq(TYPE_BOTH, 0)
+    assert_eq(TYPE_REQUEST, 1)
+    assert_eq(TYPE_RESPONSE, 2)
+
+    assert_eq(OK, 0)
+    assert_eq(PAUSED, 21)
+    assert_eq(PAUSED_UPGRADE, 22)
+end enum_constants_are_read

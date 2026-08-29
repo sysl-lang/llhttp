@@ -1,0 +1,163 @@
+module sh.sysl.llhttp
+@tests
+
+// The accumulating tier: whole requests, and the two limits that stop one being unbounded.
+
+import sysl.buf.{Buf, buf}
+
+// Somewhere for a callback to put what it was handed, since a test cannot assert from inside one.
+private struct Caught
+    seen: Buf[string]
+    last_body: string
+    last_host: string
+    keep: bool
+    headers: usize
+    cookies: Buf[string]
+
+    take(*self, r: &Request)
+        self.seen.push(r.method + " " + r.target)
+        self.last_body = r.text()
+        self.last_host = r.header("host").unwrap_or("-")
+        self.keep = r.keep_alive
+        self.headers = r.headers.len()
+end Caught
+
+private caught() -> &Caught = Caught(buf(), "", "", false, 0, buf())
+
+private first(c: &Caught) -> string = if c.seen.is_empty() then "" else c.seen.at(0)
+
+@test("a whole request reaches the callback with its parts assembled")
+a_whole_request()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed("POST /items?page=2 HTTP/1.1\r\nHost: example.com\r\nContent-Length: 8\r\n\r\nhi there"
+        .bytes).expect("fed")
+
+    assert_eq(first(c), "POST /items?page=2")
+    assert_eq(c.last_body, "hi there")
+    assert_eq(c.last_host, "example.com")
+    assert_eq(c.headers, 2)
+
+// **The case a hand-written accumulator gets wrong.** llhttp reports a header value as however many
+// spans the bytes were split into, so a value straddling two reads arrives in two pieces -- and a
+// reader that treated each span as a whole value would deliver `example` and `.com` as two headers.
+@test("a request split across reads assembles into the same request")
+a_request_split_across_reads()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+    val text = "GET /x HTTP/1.1\r\nHost: example.com\r\nAccept: text/plain\r\n\r\n".bytes
+
+    for i in 0..<text.len
+        r.feed(text[i..<i + 1]).expect("fed a byte")
+
+    assert_eq(first(c), "GET /x")
+    assert_eq(c.last_host, "example.com")
+    assert_eq(c.headers, 2)
+
+@test("a header is found without regard to case, and a repeated one is kept")
+headers_match_without_case()
+    val c = caught()
+
+    // The collection has to live in the box the closure captured, not in a `var` beside it: a
+    // closure captures by value, so a `Buf` named out here would be a copy the test never sees
+    // written to.
+    val r = requests((req) ->
+        c.take(req)
+
+        val all = req.header_all("SET-COOKIE")
+
+        for i in 0..<all.len() do c.cookies.push(all.at(i)))
+
+    r.feed(("GET / HTTP/1.1\r\nHOST: e.com\r\nSet-Cookie: a=1\r\nset-cookie: b=2\r\n\r\n")
+        .bytes).expect("fed")
+
+    assert_eq(c.last_host, "e.com", "a lowercase lookup found an uppercase header")
+    assert_eq(c.cookies.len(), 2, "both cookies were kept")
+    assert_eq(c.cookies.at(0), "a=1")
+    assert_eq(c.cookies.at(1), "b=2")
+
+@test("two pipelined requests are two calls")
+two_requests_on_one_connection()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed(("GET /one HTTP/1.1\r\nHost: e.com\r\n\r\n" +
+            "GET /two HTTP/1.1\r\nHost: e.com\r\n\r\n").bytes).expect("fed")
+
+    assert_eq(c.seen.len(), 2)
+    assert_eq(c.seen.at(0), "GET /one")
+    assert_eq(c.seen.at(1), "GET /two")
+
+@test("a chunked body is assembled, and its trailers are headers")
+a_chunked_request_with_trailers()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed(("POST /up HTTP/1.1\r\nHost: e.com\r\nTransfer-Encoding: chunked\r\n\r\n" +
+            "4\r\nfour\r\n5\r\n five\r\n0\r\nX-Sum: 9\r\n\r\n").bytes).expect("fed")
+
+    assert_eq(c.last_body, "four five")
+    assert_eq(c.headers, 3, "the trailer is a header like any other")
+
+@test("Connection: close is reported on the request the callback is handed")
+keep_alive_is_read_where_it_is_settled()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed("GET / HTTP/1.1\r\nConnection: close\r\n\r\n".bytes).expect("fed")
+
+    assert(!c.keep, "the client asked for the connection to end")
+
+// -- The limits ------------------------------------------------------------------------------------
+
+// **This is why the tier has limits at all.** Without one, a client that sends
+// `Content-Length: 4294967296` and then keeps writing owns the machine -- and it does not even have
+// to be malicious, since a file upload to a JSON endpoint looks exactly the same.
+@test("a body over the limit is refused, and the refusal says which limit")
+a_body_over_the_limit_is_refused()
+    val c = caught()
+    val r = requests((req) -> c.take(req), Limits(8192, 8))
+
+    val e = r.feed("POST / HTTP/1.1\r\nContent-Length: 20\r\n\r\n01234567890123456789".bytes)
+        .expect_err("refused")
+
+    e match
+        BodyTooLarge(n) -> assert_eq(n, 8)
+        _ -> assert(false, "it should have been the body limit")
+
+    assert(c.seen.is_empty(), "and no request was delivered")
+
+@test("headers over the limit are refused before the body is reached")
+a_head_over_the_limit_is_refused()
+    val c = caught()
+    val r = requests((req) -> c.take(req), Limits(32, 1048576))
+
+    val e = r.feed(("GET /a-fairly-long-target-that-is-charged-too HTTP/1.1\r\n" +
+                    "Host: example.com\r\n\r\n").bytes).expect_err("refused")
+
+    e match
+        HeadTooLarge(n) -> assert_eq(n, 32)
+        _ -> assert(false, "it should have been the head limit")
+
+@test("a malformed request is a Malformed refusal carrying llhttp's fault")
+a_malformed_request_is_reported_as_one()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    val e = r.feed("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nx".bytes)
+        .expect_err("refused")
+
+    e match
+        Malformed(f) -> assert(f.suspicious(), "two lengths that disagree is worth a log line")
+        _ -> assert(false, "it should have been a parse failure")
+
+@test("a request with no body still arrives, with an empty one")
+a_request_with_no_body()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed("DELETE /items/7 HTTP/1.1\r\nHost: e.com\r\n\r\n".bytes).expect("fed")
+
+    assert_eq(first(c), "DELETE /items/7")
+    assert_eq(c.last_body, "")
