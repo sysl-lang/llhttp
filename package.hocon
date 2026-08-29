@@ -3,7 +3,7 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       llhttp { git = "github.com/sysl-lang/llhttp", version = "0.1.0" }
+//       llhttp { git = "github.com/sysl-lang/llhttp", version = "0.2.0" }
 //     }
 //
 // **Nothing has to be installed.** llhttp is three C files and a header, all vendored here, so
@@ -13,7 +13,7 @@
 
 package {
   name    = "llhttp"
-  version = "0.1.0"
+  version = "0.2.0"
 
   // **The compiler this was written against.** The floor is a fact rather than a reconstruction:
   // nothing here has been built with an older release. What it certainly needs is a closure written

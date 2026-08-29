@@ -44,12 +44,13 @@ tests in this package rather than paragraphs:
 refused whichever it answers, and what the answer is for is deciding whether a refusal is worth a log
 line. A malformed request from a browser is noise; one of these is somebody trying it on.
 
-## Two tiers, and most programs want the second
+## Three tiers, and most programs want the second
 
 ```
 sh/sysl/llhttp/
     parser.sysl      Parser -- bytes in, events out. Nothing is accumulated and nothing is copied
     request.sysl     Requests -- whole requests, assembled, with limits on how much is held
+                     Stream -- the head whole, then the body as it arrives
     error.sysl       Stop and Fault
     c/c.sysl         llhttp as C declares it: the externs, the sizes, the enumerations
     c/llhttp.[ch]    llhttp itself, from the release/v9.4.3 tag, unmodified
@@ -79,8 +80,35 @@ r.feed(chunk) match
     Err(Malformed(f)) -> respond(400)
 ```
 
-A server that streams a large upload rather than holding it uses `Parser` directly, which is the
-tier below and holds nothing at all.
+A server that will not hold the body wants `Stream`, next.
+
+### `Stream` — the head whole, the body in pieces
+
+The same assembly, and one arm different: where `Requests` extends a buffer, this calls the handler.
+
+```sysl
+val s = stream((part) -> part match
+    Headers(h) -> open_a_file_for(h.target)
+    Chunk(b) -> write(b)
+    End -> finish())
+
+s.feed(chunk)?
+```
+
+**The head is bounded and the body is not, and that is the right way round.** A head has to be held
+to be useful, so it has a limit; a body is held by nobody here, so it needs no limit to be safe.
+The trap `Requests` exists to close — that raising the body limit to fit the upload is raising it to
+fit the attack — does not arise, because the memory a request costs no longer depends on its size.
+A server that wants a ceiling anyway passes one: `stream(on, 8192, Some(1073741824))` refuses with
+`BodyTooLarge` at the byte that crosses it, having already delivered everything before it.
+
+`keep_alive` is on the head, which is earlier than `Requests` reports it and is where a streaming
+server needs it — it has to decide about the connection before it reads the upload. The answer is
+settled by then: it comes off the version and the `Connection` header, and the remaining question,
+whether the message ends at end-of-file, is never yes for a request.
+
+**Everything a handler is given is borrowed for the call**, the head as much as the chunks. A
+handler that keeps a header copies it.
 
 ### `Parser` — the event stream
 
@@ -223,9 +251,12 @@ capability in `package.hocon` is for the `&Parser` box, not for llhttp.
 sysl test .
 ```
 
-31 tests: the sizes and offsets against what clang measures, the ordinary requests, a request fed one
+44 tests: the sizes and offsets against what clang measures, the ordinary requests, a request fed one
 byte at a time, chunked bodies with trailers, pipelining, upgrade, pause and resume, `skip_body` for
-a response to `HEAD`, the three smuggling refusals, and both limits.
+a response to `HEAD`, the three smuggling refusals, and both limits — and, for `Stream`, a head
+delivered before a byte of its body, a body arriving in eleven calls rather than one, four megabytes
+streamed through where the accumulating tier refuses it, and the optional ceiling refusing at the
+byte that crosses it.
 
 ## Version
 

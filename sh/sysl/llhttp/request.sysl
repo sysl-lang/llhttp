@@ -17,6 +17,10 @@
 // something has to say how much: a server that grows a buffer for as long as bytes keep arriving is
 // one connection away from being over. `Limits` is that, it has defaults that suit an API server,
 // and exceeding one is a refusal rather than a crash.
+//
+// **A body too big to hold is what `Stream` is for**, further down this file. The two share every
+// line of the head assembly and disagree about one thing: what happens to the body. They are in one
+// file because that shared assembly is private to it, which is what stops the two copies drifting.
 
 module sh.sysl.llhttp
 
@@ -57,24 +61,10 @@ struct Request
      * the famous one -- so `headers` is a list rather than a map and this is the convenience over
      * it, not a claim that there was one.
      */
-    header(self, name: string) -> Option[string]
-        for i in 0..<self.headers.len()
-            val h = self.headers.at(i)
-
-            if same_name(h.name, name) then return Some(h.value)
-
-        None
+    header(self, name: string) -> Option[string] = first_named(self.headers, name)
 
     /** Every header with this name, in the order they arrived. */
-    header_all(self, name: string) -> Buf[string]
-        var out: Buf[string] = buf()
-
-        for i in 0..<self.headers.len()
-            val h = self.headers.at(i)
-
-            if same_name(h.name, name) then out.push(h.value)
-
-        out
+    header_all(self, name: string) -> Buf[string] = all_named(self.headers, name)
 
     /** The body as text, read as UTF-8 without checking it is any.
      *
@@ -110,8 +100,8 @@ impl Display for Refusal
  *
  * The defaults suit an API server: 8 KiB of head is more than any browser sends and less than any
  * attack, and a megabyte of body is a JSON document rather than a file upload. A server that
- * accepts uploads raises `body` and should be streaming rather than accumulating -- which is what
- * `Parser` is for, one tier down.
+ * accepts uploads raises `body` -- or streams it, which is `Stream` and is the better answer,
+ * since a limit large enough for the upload is also large enough for the attack.
  */
 struct Limits
     head: usize
@@ -121,24 +111,18 @@ end Limits
 /** The defaults: 8 KiB of head, 1 MiB of body. */
 default_limits() -> Limits = Limits(8192, 1048576)
 
+/** The default head limit on its own -- 8 KiB, what `Stream` uses when it is not told. */
+default_head() -> usize = 8192
+
 /** A reader that turns bytes off a connection into whole requests. */
 struct Requests
     private p: Option[&Parser]
     private on: &Fn(&Request) -> unit
     private limits: Limits
 
-    private method: string
-    private target: Buf[u8]
-    private headers: Buf[Header]
+    private head: &Assembly
     private body: Buf[u8]
 
-    // The header pair being assembled. `in_value` is what says which of the two the next span
-    // belongs to, and it is also what says a completed pair is waiting to be filed.
-    private field: Buf[u8]
-    private value: Buf[u8]
-    private in_value: bool
-
-    private head_bytes: usize
     private refusal: Option[Refusal]
 
     /** Read `bytes`.
@@ -179,54 +163,12 @@ struct Requests
             Some(q) -> q.pause()
             None -> ()
 
-    // Charged against the head limit: every byte of every field and value. The request line is
-    // charged too, through `target`.
-    private charge_head(*self, n: usize) -> bool
-        self.head_bytes += n
-
-        if self.head_bytes > self.limits.head
-            self.refuse(HeadTooLarge(self.limits.head))
-            false
-        else
-            true
-
-    private flush_pair(*self)
-        if self.in_value
-            self.headers.push(Header(from_utf8_unchecked(self.field.view()),
-                                     from_utf8_unchecked(self.value.view())))
-            self.field.clear()
-            self.value.clear()
-            self.in_value = false
-
     private start_over(*self)
-        self.method = ""
-        self.target.clear()
-        self.headers.clear()
+        self.head.start_over()
         self.body.clear()
-        self.field.clear()
-        self.value.clear()
-        self.in_value = false
-        self.head_bytes = 0
 
     private event(*self, e: Event) = e match
         MessageBegin -> self.start_over()
-
-        Method(b) -> self.method += from_utf8_unchecked(b)
-
-        Url(b) ->
-            if self.charge_head(b.len) then self.target.extend(b)
-
-        HeaderField(b) ->
-            self.flush_pair()
-
-            if self.charge_head(b.len) then self.field.extend(b)
-
-        HeaderValue(b) ->
-            self.in_value = true
-
-            if self.charge_head(b.len) then self.value.extend(b)
-
-        HeadersComplete -> self.flush_pair()
 
         Body(b) ->
             if self.body.len() + b.len > self.limits.body
@@ -235,31 +177,327 @@ struct Requests
                 self.body.extend(b)
 
         MessageComplete ->
-            // Trailers arrive after the last chunk and before this, so they are filed here for the
-            // same reason the ordinary headers are: a pair is complete when the next thing starts.
-            self.flush_pair()
+            // Trailers arrive after the last chunk and before this, so the pair still being
+            // assembled is filed here for the same reason the ordinary headers are: a pair is
+            // complete when the next thing starts.
+            self.head.file_pair()
 
             val p = self.p match
                 Some(q) -> q
                 None -> return
 
-            val req: &Request = Request(self.method, from_utf8_unchecked(self.target.view()),
+            val req: &Request = Request(self.head.method, self.head.target_text(),
                                         p.version().0, p.version().1,
-                                        self.headers, self.body, p.keep_alive(), p.is_upgrade())
+                                        self.head.headers, self.body, p.keep_alive(),
+                                        p.is_upgrade())
 
             self.on(req)
             self.start_over()
 
-        _ -> ()
+        _ ->
+            if !self.head.take(e, self.limits.head) then self.refuse(HeadTooLarge(self.limits.head))
 end Requests
 
 /** A reader for one connection. `on` is called once per complete request. */
 requests(on: &Fn(&Request) -> unit, limits: Limits = default_limits()) -> &Requests
-    var r: &Requests = Requests(None, on, limits, "", buf(), buf(), buf(), buf(), buf(), false,
-                                0, None)
+    var r: &Requests = Requests(None, on, limits, assembly(), buf(), None)
 
     r.p = Some(request_parser((e) -> r.event(e)))
     r
+
+// ## Heads whole, bodies in pieces
+//
+//     val s = stream((part) -> part match
+//         Headers(h) -> print(h.method + " " + h.target)
+//         Chunk(b) -> out.write(b)
+//         End -> print("that was the whole body"))
+//
+//     s.feed(bytes)?
+//
+// **The tier for a body that must not be held.** `Requests` accumulates, which is right for a JSON
+// document and wrong for an upload: the limit that makes accumulating safe is the same limit that
+// makes the upload fail, and raising it to fit the upload is raising it to fit the attack. This
+// delivers the head as soon as it is complete and then hands out the body as it arrives, so the
+// memory a request costs does not depend on how big the request is.
+//
+// **It is not `Parser` with a helper**, which is why it is here rather than left to a caller.
+// Everything above the body -- the request line, the header spans, the pairs, the trailers, the
+// byte count charged against a limit -- is assembled exactly as `Requests` assembles it, out of the
+// same `Assembly`. What differs is one arm: where `Requests` extends a buffer, this calls the
+// handler.
+//
+// **The head is bounded and the body is not, and that is the right way round.** A head has to be
+// held to be useful, so it has a limit; a body is held by nobody here, so it needs no limit to be
+// safe. A caller that wants one anyway -- a server that will not accept an upload over a gigabyte,
+// however it arrives -- passes `body` and gets `BodyTooLarge` at the byte that crosses it.
+
+/** The head of a request: everything that arrives before the body.
+ *
+ * **Valid for the call and not after it**, which is this package's rule everywhere and is the one
+ * thing a handler has to know. The strings and the header list are built over the reader's own
+ * storage, and the reader writes the next request through them. A handler that keeps anything
+ * copies it.
+ */
+struct Head
+    method: string
+    target: string
+    major: u8
+    minor: u8
+    headers: Buf[Header]
+
+    /** Whether the connection should stay open for another request.
+     *
+     * **Settled here, early as this looks.** It is read off the version and the `Connection`
+     * header, which llhttp has both of by the end of the head, and the remaining question --
+     * whether the message ends at end-of-file -- is never yes for a request. So a server can
+     * decide about the connection before it has seen a byte of the body, which is what it needs
+     * when the body is an upload it is about to stream to disk.
+     */
+    keep_alive: bool
+
+    /** Whether the client asked to upgrade to another protocol. */
+    upgrade: bool
+
+    /** The first header with this name, matched without regard to case. */
+    header(self, name: string) -> Option[string] = first_named(self.headers, name)
+
+    /** Every header with this name, in the order they arrived. */
+    header_all(self, name: string) -> Buf[string] = all_named(self.headers, name)
+end Head
+
+/** One thing a streaming reader delivers. Exactly one `Headers` and one `End` per request, with
+ * however many `Chunk`s the body happened to arrive in between them -- none at all for a request
+ * that has no body.
+ */
+enum Part
+    /** The head is complete. The body has not started. */
+    Headers(head: &Head)
+
+    /** Some of the body.
+     *
+     * **The slice is the caller's own input buffer**, valid for the call and not after it, exactly
+     * as `Parser` hands one out. A handler that writes it somewhere writes it now; a handler that
+     * keeps it keeps a window onto the bytes of the next read.
+     */
+    Chunk(bytes: []const u8)
+
+    /** The body is over, and with it the request. On a keep-alive connection the next byte fed
+     * starts the next one.
+     */
+    End
+end Part
+
+/** A reader that turns bytes off a connection into a head and then a body. */
+struct Stream
+    private p: Option[&Parser]
+    private on: &Fn(Part) -> unit
+
+    private head_limit: usize
+    private body_limit: Option[usize]
+
+    private head: &Assembly
+    private body_bytes: usize
+
+    private refusal: Option[Refusal]
+
+    /** Read `bytes`.
+     *
+     * Every part they complete is handed to the callback before this returns -- so a handler that
+     * writes the body to a file has written everything that arrived by the time this answers.
+     */
+    feed(*self, bytes: []const u8) -> Result[Stop, Refusal]
+        val p = self.p match
+            Some(q) -> q
+            None -> return Ok(Done)
+
+        val out = p.execute(bytes)
+
+        // A limit refused during the parse paused it, so llhttp reports a pause rather than a
+        // failure -- which is exactly right for llhttp and not what the caller asked about.
+        self.refusal match
+            Some(r) ->
+                self.refusal = None
+                return Err(r)
+            None -> ()
+
+        out match
+            Ok(s) -> Ok(s)
+            Err(f) -> Err(Malformed(f))
+
+    /** Tell the reader the connection closed, so that a request ending at end-of-file completes. */
+    finish(*self) -> Result[unit, Refusal] = self.p match
+        Some(q) -> q.finish() match
+            Ok(_) -> Ok(())
+            Err(f) -> Err(Malformed(f))
+        None -> Ok(())
+
+    private refuse(*self, r: Refusal)
+        self.refusal = Some(r)
+
+        self.p match
+            Some(q) -> q.pause()
+            None -> ()
+
+    private deliver_head(*self)
+        val p = self.p match
+            Some(q) -> q
+            None -> return
+
+        val h: &Head = Head(self.head.method, self.head.target_text(),
+                            p.version().0, p.version().1, self.head.headers,
+                            p.keep_alive(), p.is_upgrade())
+
+        self.on(Headers(h))
+
+    private event(*self, e: Event) = e match
+        MessageBegin ->
+            self.head.start_over()
+            self.body_bytes = 0
+
+        HeadersComplete ->
+            self.head.file_pair()
+            self.deliver_head()
+
+        Body(b) ->
+            self.body_bytes += b.len
+
+            self.body_limit match
+                Some(n) ->
+                    if self.body_bytes > n
+                        self.refuse(BodyTooLarge(n))
+                    else
+                        self.on(Chunk(b))
+                None -> self.on(Chunk(b))
+
+        MessageComplete ->
+            self.head.file_pair()
+            self.on(End)
+            self.head.start_over()
+            self.body_bytes = 0
+
+        // A trailer arriving after the head has gone out is charged against the head limit and
+        // then never read, which is deliberate on both counts: the charge is what stops a client
+        // dribbling trailers forever, and the head the handler was given has been and gone.
+        _ ->
+            if !self.head.take(e, self.head_limit) then self.refuse(HeadTooLarge(self.head_limit))
+end Stream
+
+/** A reader for one connection, delivering each request as a head and then its body.
+ *
+ * `head` bounds what is held; `body` is `None` for a body of any size, which is the point of
+ * streaming, or `Some(n)` for a server that has a ceiling anyway.
+ */
+stream(on: &Fn(Part) -> unit, head: usize = default_head(),
+       body: Option[usize] = None) -> &Stream
+    var s: &Stream = Stream(None, on, head, body, assembly(), 0, None)
+
+    s.p = Some(request_parser((e) -> s.event(e)))
+    s
+
+// ## The head, as it is being assembled
+//
+// **Both tiers need every line of this**, which is why it is a thing rather than a handful of fields
+// on `Requests`. llhttp reports a header name or a value as however many spans the bytes happened to
+// arrive in, so a reader has to concatenate them, keep the field and the value in step, file a pair
+// when the next one starts, and charge every byte against a limit -- and a reader that streams the
+// body needs all of that exactly as much as one that accumulates it. Written twice it would drift,
+// and the half that drifted would be the half nobody was reading.
+
+private struct Assembly
+    method: string
+    target: Buf[u8]
+    headers: Buf[Header]
+
+    // The header pair being assembled. `in_value` is what says which of the two the next span
+    // belongs to, and it is also what says a completed pair is waiting to be filed.
+    field: Buf[u8]
+    value: Buf[u8]
+    in_value: bool
+
+    // Every byte of every field and value, and the request line through `target`.
+    bytes: usize
+
+    start_over(*self)
+        self.method = ""
+        self.target.clear()
+        self.headers.clear()
+        self.field.clear()
+        self.value.clear()
+        self.in_value = false
+        self.bytes = 0
+
+    file_pair(*self)
+        if self.in_value
+            self.headers.push(Header(from_utf8_unchecked(self.field.view()),
+                                     from_utf8_unchecked(self.value.view())))
+            self.field.clear()
+            self.value.clear()
+            self.in_value = false
+
+    target_text(self) -> string = from_utf8_unchecked(self.target.view())
+
+    // Answers false once the head has gone past `limit`, which is the caller's cue to refuse. The
+    // bytes that took it over are dropped rather than kept: nothing is going to read them, and
+    // keeping them would be growing the buffer the limit exists to bound.
+    take(*self, e: Event, limit: usize) -> bool
+        e match
+            MessageBegin -> self.start_over()
+
+            Method(b) -> self.method += from_utf8_unchecked(b)
+
+            Url(b) ->
+                if !self.charge(b.len, limit) then return false
+
+                self.target.extend(b)
+
+            HeaderField(b) ->
+                self.file_pair()
+
+                if !self.charge(b.len, limit) then return false
+
+                self.field.extend(b)
+
+            HeaderValue(b) ->
+                self.in_value = true
+
+                if !self.charge(b.len, limit) then return false
+
+                self.value.extend(b)
+
+            HeadersComplete -> self.file_pair()
+
+            _ -> ()
+
+        true
+
+    private charge(*self, n: usize, limit: usize) -> bool
+        self.bytes += n
+        self.bytes <= limit
+end Assembly
+
+private assembly() -> &Assembly = Assembly("", buf(), buf(), buf(), buf(), false, 0)
+
+// ## Looking a header up
+//
+// Shared by `Request` and `Head`, which want the same two answers about the same list.
+
+private first_named(headers: Buf[Header], name: string) -> Option[string]
+    for i in 0..<headers.len()
+        val h = headers.at(i)
+
+        if same_name(h.name, name) then return Some(h.value)
+
+    None
+
+private all_named(headers: Buf[Header], name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<headers.len()
+        val h = headers.at(i)
+
+        if same_name(h.name, name) then out.push(h.value)
+
+    out
 
 // Two header names are the same name when they differ only in case, which is what RFC 9110 says and
 // what every client assumes. Compared byte by byte rather than by lowercasing both, so that matching

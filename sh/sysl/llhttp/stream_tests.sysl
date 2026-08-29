@@ -1,0 +1,236 @@
+module sh.sysl.llhttp
+@tests
+
+// The streaming tier: the head whole, the body in pieces, and nothing held that does not have to be.
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// Somewhere for a handler to put what it was handed, since a test cannot assert from inside one.
+//
+// **It copies, which is the rule this tier is written to.** Everything a handler is given is valid
+// for the call and not after it, so a test that kept the `&Head` would be testing the aliasing
+// rather than the parse.
+private struct Log
+    order: Buf[string]
+    body: Buf[u8]
+    host: string
+    keep: bool
+    headers: usize
+    chunks: usize
+
+    part(*self, p: Part) = p match
+        Headers(h) ->
+            self.order.push("head " + h.method + " " + h.target)
+            self.host = h.header("host").unwrap_or("-")
+            self.keep = h.keep_alive
+            self.headers = h.headers.len()
+
+        Chunk(b) ->
+            self.chunks += 1
+            self.body.extend(b)
+
+        End -> self.order.push("end")
+end Log
+
+private log() -> &Log = Log(buf(), buf(), "", false, 0, 0)
+
+private text(l: &Log) -> string = from_utf8_unchecked(l.body.view())
+
+private steps(l: &Log) -> string
+    var out = ""
+
+    for i in 0..<l.order.len()
+        if i > 0 then out += ", "
+
+        out += l.order.at(i)
+
+    out
+
+@test("the head arrives before the body, and the body follows it")
+the_head_comes_first()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+
+    s.feed("POST /items?page=2 HTTP/1.1\r\nHost: example.com\r\nContent-Length: 8\r\n\r\nhi there"
+        .bytes).expect("fed")
+
+    assert_eq(steps(l), "head POST /items?page=2, end")
+    assert_eq(text(l), "hi there")
+    assert_eq(l.host, "example.com")
+    assert_eq(l.headers, 2)
+
+// **The case the tier exists for.** A body arriving in forty reads is delivered in forty calls and
+// none of it is kept, where `Requests` would have grown one buffer to the whole of it.
+@test("a body split across reads arrives as several chunks and none of it is held")
+a_body_arrives_in_pieces()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+
+    s.feed("POST /up HTTP/1.1\r\nHost: e.com\r\nContent-Length: 11\r\n\r\n".bytes).expect("head")
+
+    assert_eq(steps(l), "head POST /up", "the head went out before a byte of the body arrived")
+    assert_eq(l.chunks, 0)
+
+    val body = "hello world".bytes
+
+    for i in 0..<body.len
+        s.feed(body[i..<i + 1]).expect("fed a byte")
+
+    assert_eq(l.chunks, 11, "one call per read, not one per request")
+    assert_eq(text(l), "hello world")
+    assert_eq(steps(l), "head POST /up, end")
+
+// The head is assembled out of spans exactly as the accumulating tier assembles it, so the case
+// that catches a hand-written reader -- a header value straddling two reads -- has to be caught
+// here too, and by the same code.
+@test("a head split byte by byte assembles into the same head")
+a_head_split_across_reads()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+    val head = "GET /x HTTP/1.1\r\nHost: example.com\r\nAccept: text/plain\r\n\r\n".bytes
+
+    for i in 0..<head.len
+        s.feed(head[i..<i + 1]).expect("fed a byte")
+
+    assert_eq(steps(l), "head GET /x, end")
+    assert_eq(l.host, "example.com")
+    assert_eq(l.headers, 2)
+
+@test("a body larger than the accumulating tier would ever hold streams through")
+a_body_too_big_to_hold()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+    val size: usize = 4194304
+    var block: Buf[u8] = buf()
+
+    for i in 0..<65536
+        block.push(u8(65 + i % 26))
+
+    s.feed(("PUT /blob HTTP/1.1\r\nHost: e.com\r\nContent-Length: " + str(size) + "\r\n\r\n").bytes)
+        .expect("head")
+
+    for i in 0..<size / 65536
+        s.feed(block.view()).expect("fed a block")
+
+    assert_eq(steps(l), "head PUT /blob, end")
+    assert_eq(l.body.len(), size, "every byte was delivered")
+    assert_eq(l.chunks, 64)
+
+@test("a chunked body is delivered decoded, without its chunk framing")
+a_chunked_body_streams()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+
+    s.feed(("POST /up HTTP/1.1\r\nHost: e.com\r\nTransfer-Encoding: chunked\r\n\r\n" +
+            "4\r\nfour\r\n5\r\n five\r\n0\r\nX-Sum: 9\r\n\r\n").bytes).expect("fed")
+
+    assert_eq(text(l), "four five")
+    assert_eq(steps(l), "head POST /up, end")
+    assert_eq(l.headers, 2, "the trailer arrived after the head had gone out")
+
+@test("a request with no body is a head and an end, with nothing between them")
+a_streamed_request_with_no_body()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+
+    s.feed("DELETE /items/7 HTTP/1.1\r\nHost: e.com\r\n\r\n".bytes).expect("fed")
+
+    assert_eq(steps(l), "head DELETE /items/7, end")
+    assert_eq(l.chunks, 0)
+
+@test("two pipelined requests are two heads and two ends, and their bodies do not run together")
+two_streamed_requests_on_one_connection()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+
+    s.feed(("POST /one HTTP/1.1\r\nHost: e.com\r\nContent-Length: 3\r\n\r\naaa" +
+            "POST /two HTTP/1.1\r\nHost: e.com\r\nContent-Length: 3\r\n\r\nbbb").bytes).expect("fed")
+
+    assert_eq(steps(l), "head POST /one, end, head POST /two, end")
+    assert_eq(text(l), "aaabbb")
+
+// **A streaming server needs this answer earlier than an accumulating one does**, since it has to
+// decide about the connection before the upload it is about to read.
+@test("Connection: close is readable on the head, before the body")
+keep_alive_is_readable_on_the_head()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+
+    s.feed("POST / HTTP/1.1\r\nConnection: close\r\nContent-Length: 2\r\n\r\n".bytes).expect("head")
+
+    assert_eq(steps(l), "head POST /")
+    assert(!l.keep, "the client asked for the connection to end")
+
+@test("a keep-alive request says so on the head")
+keep_alive_is_the_default()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+
+    s.feed("GET / HTTP/1.1\r\nHost: e.com\r\n\r\n".bytes).expect("fed")
+
+    assert(l.keep, "HTTP/1.1 keeps the connection unless the client says otherwise")
+
+// -- The limits ------------------------------------------------------------------------------------
+
+@test("headers over the limit are refused before the head goes out")
+a_streamed_head_over_the_limit_is_refused()
+    val l = log()
+    val s = stream((p) -> l.part(p), 32)
+
+    val e = s.feed(("GET /a-fairly-long-target-that-is-charged-too HTTP/1.1\r\n" +
+                    "Host: example.com\r\n\r\n").bytes).expect_err("refused")
+
+    e match
+        HeadTooLarge(n) -> assert_eq(n, 32)
+        _ -> assert(false, "it should have been the head limit")
+
+    assert_eq(steps(l), "", "and nothing was delivered")
+
+// **The ceiling is optional and off by default**, which is the difference between this tier and the
+// other one: a body nobody holds needs no limit to be safe. A server with a ceiling anyway asks for
+// one, and gets it at the byte that crosses it rather than after the upload has finished.
+@test("a body ceiling refuses at the byte that crosses it, and the chunks before it were delivered")
+a_body_ceiling_is_asked_for()
+    val l = log()
+    val s = stream((p) -> l.part(p), default_head(), Some(4))
+
+    s.feed("POST / HTTP/1.1\r\nContent-Length: 20\r\n\r\n".bytes).expect("head")
+
+    val e = s.feed("0123456789".bytes).expect_err("refused")
+
+    e match
+        BodyTooLarge(n) -> assert_eq(n, 4)
+        _ -> assert(false, "it should have been the body ceiling")
+
+    assert_eq(steps(l), "head POST /", "the request never ended")
+
+@test("with no ceiling a body of any size is accepted where the accumulating tier would refuse")
+no_ceiling_by_default()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+    val r = requests((_) -> ())
+    var big = "x"
+
+    for i in 0..<21
+        big += big
+
+    val head = "POST / HTTP/1.1\r\nContent-Length: " + str(big.bytes.len) + "\r\n\r\n"
+
+    r.feed((head + big).bytes).expect_err("the accumulating tier refuses it")
+    s.feed((head + big).bytes).expect("the streaming tier does not")
+
+    assert_eq(l.body.len(), big.bytes.len)
+    assert_eq(steps(l), "head POST /, end")
+
+@test("a malformed request is a Malformed refusal here too")
+a_streamed_malformed_request_is_reported_as_one()
+    val l = log()
+    val s = stream((p) -> l.part(p))
+
+    val e = s.feed("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nx".bytes)
+        .expect_err("refused")
+
+    e match
+        Malformed(f) -> assert(f.suspicious(), "two lengths that disagree is worth a log line")
+        _ -> assert(false, "it should have been a parse failure")
