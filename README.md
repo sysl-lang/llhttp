@@ -5,7 +5,7 @@ HTTP/1.1, parsed for [sysl](https://github.com/sysl-lang/sysl) — bound to
 
 ```
 dependencies {
-  llhttp { git = "github.com/sysl-lang/llhttp", version = "0.1.0" }
+  llhttp { git = "github.com/sysl-lang/llhttp", version = "0.2.1" }
 }
 ```
 

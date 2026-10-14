@@ -98,7 +98,6 @@ struct Parser
     // so this has to live as long as the parser does, which is why it is a field and not a local.
     private cfg: c.Settings
 
-    private me: Option[&Parser]
     private handler: &Fn(Event) -> unit
 
     // Set by `skip_body` and read once, by the `on_headers_complete` trampoline.
@@ -326,9 +325,8 @@ either_parser(on: &Fn(Event) -> unit) -> &Parser = parser(on, c.TYPE_BOTH)
 
 /** A parser of the given llhttp type, for a caller that has the number rather than the intent. */
 parser(on: &Fn(Event) -> unit, ty: u8) -> &Parser
-    var p: &Parser = Parser([0; c.PARSER_WORDS], settings(), None, on, false, false, false)
+    var p: &Parser = Parser([0; c.PARSER_WORDS], settings(), on, false, false, false)
 
-    p.me = Some(p)
     c.init(p.raw(), ty, ptr_cast(&p.cfg))
     p
 

@@ -161,3 +161,62 @@ a_request_with_no_body()
 
     assert_eq(first(c), "DELETE /items/7")
     assert_eq(c.last_body, "")
+
+// -- A reader does not outlive its owner ---------------------------------------------------------
+
+// Counts how many of its kind have been destroyed, so a test can see a reader's callback released
+// when the reader is, rather than kept alive by a cycle through the parser.
+private struct Tally
+    gone: int
+    heads: int
+
+private struct Probe
+    tally: &Tally
+
+impl Drop for Probe
+    drop(self) = self.tally.gone += 1
+
+@test("a dropped requests reader releases its callback")
+a_dropped_reader_is_freed()
+    val t: &Tally = Tally(0, 0)
+    val seen = caught()
+
+    for i in 0..<3
+        val probe: &Probe = Probe(t)
+        val r = requests((req) ->
+            probe.tally.gone += 0
+            seen.take(req))
+
+        r.feed("GET /a HTTP/1.1\r\nHost: x\r\n\r\n".bytes).expect("parsed")
+
+    assert_eq(seen.seen.len(), 3, "each reader delivered its request")
+    assert_eq(t.gone, 3, "and each was released when it went out of scope")
+
+@test("a dropped stream reader releases its callback")
+a_dropped_stream_is_freed()
+    val t: &Tally = Tally(0, 0)
+
+    for i in 0..<3
+        val probe: &Probe = Probe(t)
+        val s = stream((part) ->
+            probe.tally.gone += 0
+            part match
+                Headers(h) -> probe.tally.heads += 1
+                _ -> ())
+
+        s.feed("GET /a HTTP/1.1\r\nHost: x\r\n\r\n".bytes).expect("parsed")
+
+    assert_eq(t.heads, 3, "each reader delivered its head")
+    assert_eq(t.gone, 3, "and each was released when it went out of scope")
+
+@test("a dropped parser releases its callback")
+a_dropped_parser_is_freed()
+    val t: &Tally = Tally(0, 0)
+
+    for i in 0..<3
+        val probe: &Probe = Probe(t)
+        val p = request_parser((e) -> probe.tally.gone += 0)
+
+        p.execute("GET / HTTP/1.1\r\n\r\n".bytes).expect("parsed")
+
+    assert_eq(t.gone, 3, "each parser was released when it went out of scope")

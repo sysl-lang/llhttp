@@ -202,7 +202,13 @@ end Requests
 requests(on: &Fn(&Request) -> unit, limits: Limits = default_limits()) -> &Requests
     var r: &Requests = Requests(None, on, limits, assembly(), buf(), None)
 
-    r.p = Some(request_parser((e) -> r.event(e)))
+    // The parser's callback reaches the reader through a weak edge, so the pair does not keep each
+    // other alive: the reader owns the parser and the parser only observes the reader.
+    val w: weak Requests = r
+
+    r.p = Some(request_parser((e) -> w.get() match
+        Some(q) -> q.event(e)
+        None -> ()))
     r
 
 // ## Heads whole, bodies in pieces
@@ -391,7 +397,12 @@ stream(on: &Fn(Part) -> unit, head: usize = default_head(),
        body: Option[usize] = None) -> &Stream
     var s: &Stream = Stream(None, on, head, body, assembly(), 0, None)
 
-    s.p = Some(request_parser((e) -> s.event(e)))
+    // Weak for the reason `requests` gives: the stream owns its parser, not the other way round.
+    val w: weak Stream = s
+
+    s.p = Some(request_parser((e) -> w.get() match
+        Some(q) -> q.event(e)
+        None -> ()))
     s
 
 // ## The head, as it is being assembled
