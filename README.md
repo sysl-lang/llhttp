@@ -3,6 +3,8 @@
 HTTP/1.1, parsed for [sysl](https://github.com/sysl-lang/sysl) — bound to
 [llhttp](https://github.com/nodejs/llhttp), the parser Node.js is built on.
 
+*An independent sysl package for llhttp. It is not affiliated with or endorsed by llhttp's authors or trademark holders.*
+
 ```
 dependencies {
   llhttp { git = "github.com/sysl-lang/llhttp", version = "0.2.1" }
