@@ -124,6 +124,19 @@ struct Requests
     private body: Buf[u8]
 
     private refusal: Option[Refusal]
+    private in_head: bool
+
+    /** Whether a request's head is partway through arriving: true from the first byte of a request
+     * until the blank line that ends its head, and false otherwise.
+     *
+     * It is for header-read deadlines, the slowloris defence: start the clock when a request begins,
+     * stop it when this turns false, so that a head dribbled one byte at a time is cut off while a
+     * slow body upload is not. On a keep-alive connection it goes true again at the next request's
+     * first byte. It is false before any byte has arrived and after an error, and so "no request
+     * has started" and "a head is in progress" are told apart by this answer alone: false is the
+     * former, true the latter.
+     */
+    heading(*self) -> bool = self.in_head
 
     /** Read `bytes`.
      *
@@ -142,12 +155,15 @@ struct Requests
         self.refusal match
             Some(r) ->
                 self.refusal = None
+                self.in_head = false
                 return Err(r)
             None -> ()
 
         out match
             Ok(s) -> Ok(s)
-            Err(f) -> Err(Malformed(f))
+            Err(f) ->
+                self.in_head = false
+                Err(Malformed(f))
 
     /** Tell the reader the connection closed, so that a request ending at end-of-file completes. */
     finish(*self) -> Result[unit, Refusal] = self.p match
@@ -168,7 +184,13 @@ struct Requests
         self.body.clear()
 
     private event(*self, e: Event) = e match
-        MessageBegin -> self.start_over()
+        MessageBegin ->
+            self.in_head = true
+            self.start_over()
+
+        HeadersComplete ->
+            self.in_head = false
+            self.head.file_pair()
 
         Body(b) ->
             if self.body.len() + b.len > self.limits.body
@@ -200,7 +222,7 @@ end Requests
 
 /** A reader for one connection. `on` is called once per complete request. */
 requests(on: &Fn(&Request) -> unit, limits: Limits = default_limits()) -> &Requests
-    var r: &Requests = Requests(None, on, limits, assembly(), buf(), None)
+    var r: &Requests = Requests(None, on, limits, assembly(), buf(), None, false)
 
     // The parser's callback reaches the reader through a weak edge, so the pair does not keep each
     // other alive: the reader owns the parser and the parser only observes the reader.

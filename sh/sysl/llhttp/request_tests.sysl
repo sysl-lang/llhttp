@@ -220,3 +220,82 @@ a_dropped_parser_is_freed()
         p.execute("GET / HTTP/1.1\r\n\r\n".bytes).expect("parsed")
 
     assert_eq(t.gone, 3, "each parser was released when it went out of scope")
+
+// -- Whether a head is in progress -----------------------------------------------------------------
+
+@test("heading is false before any byte has arrived")
+heading_is_false_initially()
+    val r = requests((req) -> ())
+
+    assert(!r.heading(), "no request has started")
+
+@test("heading is true after a partial request line")
+heading_is_true_in_a_partial_request_line()
+    val r = requests((req) -> ())
+
+    r.feed("GET /par".bytes).expect("fed")
+
+    assert(r.heading(), "a request has begun and its head is not complete")
+
+@test("heading stays true while the headers dribble in one byte at a time")
+heading_is_true_while_headers_dribble()
+    val r = requests((req) -> ())
+    val text = "GET /x HTTP/1.1\r\nHost: example.com\r\nAccept: text/plain\r\n".bytes
+
+    for i in 0..<text.len
+        r.feed(text[i..<i + 1]).expect("fed a byte")
+        assert(r.heading(), "still in the head after byte " + str(i))
+
+@test("heading is false once the blank line ends the head, before the body arrives")
+heading_is_false_after_the_head()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed("POST / HTTP/1.1\r\nContent-Length: 8\r\n\r\nhi".bytes).expect("fed")
+
+    assert(!r.heading(), "the head is complete although the body is not")
+    assert(c.seen.is_empty(), "and the request has not been delivered")
+
+@test("heading is false after the full request")
+heading_is_false_after_the_request()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed("POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi".bytes).expect("fed")
+
+    assert_eq(c.seen.len(), 1)
+    assert(!r.heading(), "between requests no head is in progress")
+
+@test("heading is true again for a pipelined second request's partial head")
+heading_is_true_again_for_the_next_request()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTT".bytes).expect("fed")
+
+    assert_eq(c.seen.len(), 1)
+    assert(r.heading(), "the second request's head has begun")
+
+    r.feed("P/1.1\r\nHost: x\r\n\r\n".bytes).expect("fed")
+
+    assert_eq(c.seen.len(), 2)
+    assert(!r.heading(), "and ended")
+
+@test("heading is false after a malformed request")
+heading_is_false_after_an_error()
+    val r = requests((req) -> ())
+
+    r.feed("POST / HTTP/1.1\r\nContent-Length: 1\r\n".bytes).expect("fed")
+    assert(r.heading(), "in the head until the error")
+
+    r.feed("Content-Length: 2\r\n\r\nx".bytes).expect_err("refused")
+
+    assert(!r.heading(), "an errored reader has no head in progress")
+
+@test("heading is false after a head over the limit is refused")
+heading_is_false_after_a_refusal()
+    val r = requests((req) -> (), Limits(8, 1048576))
+
+    r.feed("GET /a-long-target-over-the-limit HTTP/1.1\r\n\r\n".bytes).expect_err("refused")
+
+    assert(!r.heading(), "a refused reader has no head in progress")
