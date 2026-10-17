@@ -299,3 +299,62 @@ heading_is_false_after_a_refusal()
     r.feed("GET /a-long-target-over-the-limit HTTP/1.1\r\n\r\n".bytes).expect_err("refused")
 
     assert(!r.heading(), "a refused reader has no head in progress")
+
+// -- Whether a request is in progress --------------------------------------------------------------
+
+@test("reading is false before any byte has arrived")
+reading_is_false_initially()
+    val r = requests((req) -> ())
+
+    assert(!r.reading(), "no request has started")
+
+@test("reading is true during a partial head")
+reading_is_true_in_a_partial_head()
+    val r = requests((req) -> ())
+
+    r.feed("GET /par".bytes).expect("fed")
+
+    assert(r.reading(), "a request has begun")
+
+@test("reading is true after the head while the body is partial")
+reading_is_true_while_the_body_is_partial()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed("POST / HTTP/1.1\r\nContent-Length: 8\r\n\r\nhi".bytes).expect("fed")
+
+    assert(!r.heading(), "the head is complete")
+    assert(r.reading(), "but the request is not")
+    assert(c.seen.is_empty(), "and has not been delivered")
+
+@test("reading is false after the request completes")
+reading_is_false_after_the_request()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed("POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi".bytes).expect("fed")
+
+    assert_eq(c.seen.len(), 1)
+    assert(!r.reading(), "between requests nothing is in progress")
+
+@test("reading is true when one read ends a request and holds the next one's head and part of its body")
+reading_is_true_across_a_pipelined_boundary()
+    val c = caught()
+    val r = requests((req) -> c.take(req))
+
+    r.feed("GET /a HTTP/1.1\r\nHost: x\r\n\r\nPOST /b HTTP/1.1\r\nContent-Length: 8\r\n\r\nhi".bytes).expect("fed")
+
+    assert_eq(c.seen.len(), 1)
+    assert(!r.heading(), "the second head is complete")
+    assert(r.reading(), "yet the second request is still arriving")
+
+@test("reading is false after a malformed request")
+reading_is_false_after_an_error()
+    val r = requests((req) -> ())
+
+    r.feed("POST / HTTP/1.1\r\nContent-Length: 1\r\n".bytes).expect("fed")
+    assert(r.reading(), "in a request until the error")
+
+    r.feed("Content-Length: 2\r\n\r\nx".bytes).expect_err("refused")
+
+    assert(!r.reading(), "an errored reader has no request in progress")

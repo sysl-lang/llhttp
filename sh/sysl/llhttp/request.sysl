@@ -125,6 +125,7 @@ struct Requests
 
     private refusal: Option[Refusal]
     private in_head: bool
+    private in_message: bool
 
     /** Whether a request's head is partway through arriving: true from the first byte of a request
      * until the blank line that ends its head, and false otherwise.
@@ -137,6 +138,19 @@ struct Requests
      * former, true the latter.
      */
     heading(*self) -> bool = self.in_head
+
+    /** Whether a request is partway through arriving, head or body: true from the first byte of a
+     * request until it is complete and handed to the callback, and false between requests, before any
+     * byte has arrived, and after an error.
+     *
+     * It differs from `heading()`, which turns false as soon as the head ends. A single read can hold
+     * the end of one request, all of the next one's head and part of its body; afterwards `heading()`
+     * is false and no complete request is queued, which looks exactly like an idle connection, while
+     * `reading()` is still true. It is for request deadlines: start the clock when a request begins
+     * and stop it when this turns false, so that a connection stuck in the middle of a request is cut
+     * off wherever it stopped.
+     */
+    reading(*self) -> bool = self.in_message
 
     /** Read `bytes`.
      *
@@ -156,6 +170,7 @@ struct Requests
             Some(r) ->
                 self.refusal = None
                 self.in_head = false
+                self.in_message = false
                 return Err(r)
             None -> ()
 
@@ -163,6 +178,7 @@ struct Requests
             Ok(s) -> Ok(s)
             Err(f) ->
                 self.in_head = false
+                self.in_message = false
                 Err(Malformed(f))
 
     /** Tell the reader the connection closed, so that a request ending at end-of-file completes. */
@@ -186,6 +202,7 @@ struct Requests
     private event(*self, e: Event) = e match
         MessageBegin ->
             self.in_head = true
+            self.in_message = true
             self.start_over()
 
         HeadersComplete ->
@@ -213,6 +230,7 @@ struct Requests
                                         self.head.headers, self.body, p.keep_alive(),
                                         p.is_upgrade())
 
+            self.in_message = false
             self.on(req)
             self.start_over()
 
@@ -222,7 +240,7 @@ end Requests
 
 /** A reader for one connection. `on` is called once per complete request. */
 requests(on: &Fn(&Request) -> unit, limits: Limits = default_limits()) -> &Requests
-    var r: &Requests = Requests(None, on, limits, assembly(), buf(), None, false)
+    var r: &Requests = Requests(None, on, limits, assembly(), buf(), None, false, false)
 
     // The parser's callback reaches the reader through a weak edge, so the pair does not keep each
     // other alive: the reader owns the parser and the parser only observes the reader.
