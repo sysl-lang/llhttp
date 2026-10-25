@@ -3,7 +3,7 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       llhttp { git = "github.com/sysl-lang/llhttp", version = "0.2.3" }
+//       llhttp { git = "github.com/sysl-lang/llhttp", version = "0.2.4" }
 //     }
 //
 // **Nothing has to be installed.** llhttp is three C files and a header, all vendored here, so
@@ -13,7 +13,7 @@
 
 package {
   name    = "llhttp"
-  version = "0.2.3"
+  version = "0.2.4"
 
   // **The compiler this was written against.** The raw-form imports (`sysl.raw.ptr_cast`) and
   // `.to_string()` need 0.6.0.
