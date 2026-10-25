@@ -15,11 +15,9 @@ package {
   name    = "llhttp"
   version = "0.2.3"
 
-  // **The compiler this was written against.** The floor is a fact rather than a reconstruction:
-  // nothing here has been built with an older release. What it certainly needs is a closure written
-  // as an argument opening its own indented block, which arrived in 0.0.76 -- every callback in the
-  // module above is registered that way.
-  sysl = "0.0.89"
+  // **The compiler this was written against.** The raw-form imports (`sysl.raw.ptr_cast`) and
+  // `.to_string()` need 0.6.0.
+  sysl = "0.6.0"
 }
 
 // **`heap`, because a parser is a `&Parser`.** llhttp hands a callback the parser it was given and

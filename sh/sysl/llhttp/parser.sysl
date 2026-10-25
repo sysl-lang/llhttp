@@ -27,6 +27,7 @@
 module sh.sysl.llhttp
 
 import sh.sysl.llhttp.c
+import sysl.raw.ptr_cast
 import sysl.slices.as_ptr
 
 /** Something llhttp found. The variants are its twenty-five callbacks, in the order the header

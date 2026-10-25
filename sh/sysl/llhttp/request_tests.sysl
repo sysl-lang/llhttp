@@ -244,7 +244,7 @@ heading_is_true_while_headers_dribble()
 
     for i in 0..<text.len
         r.feed(text[i..<i + 1]).expect("fed a byte")
-        assert(r.heading(), "still in the head after byte " + str(i))
+        assert(r.heading(), "still in the head after byte " + i.to_string())
 
 @test("heading is false once the blank line ends the head, before the body arrives")
 heading_is_false_after_the_head()

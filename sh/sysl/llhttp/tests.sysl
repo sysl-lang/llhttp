@@ -64,7 +64,7 @@ private recorder(l: &Log) -> &Fn(Event) -> unit = (e) -> e match
     HeadersComplete -> l.add("headers")
     Body(b) -> l.body += from_utf8_unchecked(b)
     MessageComplete -> l.add("done")
-    ChunkHeader(n) -> l.add("chunk=" + str(n))
+    ChunkHeader(n) -> l.add("chunk=" + n.to_string())
     ChunkComplete -> l.add("chunkend")
     Reset -> l.add("reset")
     _ -> ()

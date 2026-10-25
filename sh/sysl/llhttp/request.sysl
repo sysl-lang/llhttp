@@ -89,8 +89,8 @@ enum Refusal
 
     describe(self) -> string = self match
         Malformed(f) -> "malformed request: " + f.reason
-        BodyTooLarge(n) -> "the body is larger than " + str(n) + " bytes"
-        HeadTooLarge(n) -> "the headers are larger than " + str(n) + " bytes"
+        BodyTooLarge(n) -> "the body is larger than " + n.to_string() + " bytes"
+        HeadTooLarge(n) -> "the headers are larger than " + n.to_string() + " bytes"
 end Refusal
 
 impl Display for Refusal

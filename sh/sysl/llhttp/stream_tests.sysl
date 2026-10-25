@@ -107,7 +107,7 @@ a_body_too_big_to_hold()
     for i in 0..<65536
         block.push(u8(65 + i % 26))
 
-    s.feed(("PUT /blob HTTP/1.1\r\nHost: e.com\r\nContent-Length: " + str(size) + "\r\n\r\n").bytes)
+    s.feed(("PUT /blob HTTP/1.1\r\nHost: e.com\r\nContent-Length: " + size.to_string() + "\r\n\r\n").bytes)
         .expect("head")
 
     for i in 0..<size / 65536
@@ -215,7 +215,7 @@ no_ceiling_by_default()
     for i in 0..<21
         big += big
 
-    val head = "POST / HTTP/1.1\r\nContent-Length: " + str(big.bytes.len) + "\r\n\r\n"
+    val head = "POST / HTTP/1.1\r\nContent-Length: " + big.bytes.len.to_string() + "\r\n\r\n"
 
     r.feed((head + big).bytes).expect_err("the accumulating tier refuses it")
     s.feed((head + big).bytes).expect("the streaming tier does not")

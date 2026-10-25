@@ -60,7 +60,7 @@ end Fault
 
 impl Display for Fault
     display(self, out: *Writer, fmt: FormatSpec) =
-        display_str(self.name + " at byte " + str(self.at) + ": " + self.reason, out, fmt)
+        display_str(self.name + " at byte " + self.at.to_string() + ": " + self.reason, out, fmt)
 
 /** Two faults are the same fault when they are the same code at the same place. */
 impl Eq for Fault

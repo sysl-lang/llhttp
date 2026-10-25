@@ -56,7 +56,7 @@ sh/sysl/llhttp/
     error.sysl       Stop and Fault
     c/c.sysl         llhttp as C declares it: the externs, the sizes, the enumerations
     c/llhttp.[ch]    llhttp itself, from the release/v9.4.3 tag, unmodified
-package.hocon
+sysl.hocon
 ```
 
 ### `Requests` — whole requests
@@ -152,7 +152,7 @@ end Out
 private respond(o: &Out, r: &Request)
     val body = r.method + " " + r.target
 
-    o.reply = "HTTP/1.1 200 OK\r\nContent-Length: " + str(body.bytes.len) +
+    o.reply = "HTTP/1.1 200 OK\r\nContent-Length: " + body.bytes.len.to_string() +
               "\r\nConnection: close\r\n\r\n" + body
     o.done = true
 
@@ -245,7 +245,7 @@ C rather than of the binding.
 
 **llhttp itself allocates nothing.** `llhttp_alloc` and `llhttp_free` are the only calls that would
 and neither is bound; every byte the parser writes goes into storage this package owns. The `heap`
-capability in `package.hocon` is for the `&Parser` box, not for llhttp.
+capability in `sysl.hocon` is for the `&Parser` box, not for llhttp.
 
 ## Testing
 
